@@ -1,0 +1,51 @@
+rule "Either Jon or car owner - 1" {
+    when {
+        person: Person person.name == 'Jon';
+    }
+    then {
+        console.log('Found Jan Jon or car owner');
+    }
+}
+
+rule "Either Jon or car owner - 2" {
+    when {
+        person: Person;
+        car: Car person.name != 'Jon' && car.owner == person;
+    }
+    then {
+        console.log(
+	'Not Jon, but a car owner',
+	person,
+	car
+);
+        console.log('Found Jan Jon or car owner');
+    }
+}
+
+rule "Either Jon or car owner - 3" {
+    when {
+        person: Person person.name != 'Jon';
+    }
+    then {
+        console.log('Not a Jon', person);
+    }
+}
+
+rule "Name is Jan - 4" {
+    when {
+        person: Person person.name == 'Jan';
+    }
+    then {
+        console.log('found Jan', person);
+    }
+}
+
+rule "Tall Jans - 5" {
+    when {
+        person: Person person.name == 'Jan' && person.height >= 180;
+    }
+    then {
+        console.log('Found tall Jan', person);
+    }
+}
+

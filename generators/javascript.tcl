@@ -1,5 +1,6 @@
 
-gen::add_generator Javascript gen_js::generate
+gen::add_generator Javascript gen_js::generate_js
+gen::add_generator DrakonJS gen_js::generate_clean_js
 
 namespace eval gen_js {
 
@@ -20,6 +21,17 @@ while 	with 	yield
 }
 
 variable handlers {}
+
+variable variables {}
+
+proc extract_variables { gdb diagram_id } {
+	variable variables
+	set vars [ gen::extract_variables $gdb $diagram_id  "var" ]
+	if {$vars != "" } {
+		lappend variables $diagram_id
+		lappend variables $vars
+	}
+}
 
 
 proc highlight { tokens } {
@@ -120,6 +132,7 @@ proc make_callbacks { } {
 	gen::put_callback callbacks shelf		gen_js::shelf
 	
     gen::put_callback callbacks change_state 	gen_js::change_state
+    gen::put_callback callbacks shutdown 	""
     gen::put_callback callbacks fsm_merge   0
     
 	return $callbacks
@@ -153,15 +166,24 @@ proc extract_signature { text name } {
 	return [ list {} [ gen::create_signature procedure public $parameters "" ] ]
 }
 
-proc change_state { next_state machine_name } {
+
+proc change_state { next_state machine_name returns } {
     #item 1832
+    
     if {$next_state == ""} {
         #item 1836
-        return "self.state = null;"
+        set change "self.state = null;"
     } else {
         #item 1835
-        return "self.state = ${machine_name}_state_${next_state};"
+        set change "self.state = \"${next_state}\";"
     }
+    
+    if {$returns == {}} {
+		return $change
+	} else {
+		set output [lindex $returns 1]
+		return "$change\n$output"
+	}
 }
 
 proc p.declare { type name value } {
@@ -199,8 +221,20 @@ proc for_declare { item_id first second } {
 	return ""
 }
 
-proc generate { db gdb filename } {
+proc generate_js { db gdb filename } {
+	generate $db $gdb $filename 0
+}
+
+proc generate_clean_js { db gdb filename } {
+	generate $db $gdb $filename 1
+}
+
+
+proc generate { db gdb filename is_clean} {
     # prepare
+    
+	variable variables
+	set variables {}    
     
 	set callbacks [ make_callbacks ]
 	lassign [ gen::scan_file_description $db { header footer } ] header footer
@@ -212,14 +246,22 @@ proc generate { db gdb filename } {
     variable handlers
     set handlers [ append_sm_names $gdb ]
     set machine_ctrs [ make_machine_ctrs $gdb $machines ]
-    set machine_decl [ make_machine_declares $machines ]	
+
+    #set machine_decl [ make_machine_declares $machines ]	
+    set machine_decl {}
 	
 	# fix
 	
     set diagrams [ $gdb eval {
         select diagram_id from diagrams } ]
     
+    set keys {":" "\{" "\}"}
+    
     foreach diagram_id $diagrams {
+		if {$is_clean} {
+			extract_variables $gdb $diagram_id
+			gen::rewrite_clean $gdb $diagram_id $keys
+		}
         gen::fix_graph_for_diagram $gdb $callbacks 1 $diagram_id
     }
 
@@ -229,13 +271,15 @@ proc generate { db gdb filename } {
     
 	set use_nogoto 1
 	set functions [ gen::generate_functions $db $gdb $callbacks $use_nogoto ]
+	
+	set functions [ build_tasks $functions ]
 
 	if { [ graph::errors_occured ] } { return }
 
     # write output
     
 	set hfile [ replace_extension $filename "js" ]
-	set f [ open $hfile w ]
+	set f [ open_output_file $hfile ]
 	catch {
 		p.print_to_file $f $functions $header $footer $machine_decl $machine_ctrs
 	} error_message
@@ -256,7 +300,7 @@ proc make_machine_ctrs { gdb machines } {
 
         set ctr [make_machine_ctr $gdb $name $states $param_names $messages]
 
-        append result $ctr    
+        append result "\n$ctr\n"
     }
     return $result
 }
@@ -279,14 +323,16 @@ proc get_function { gdb name state message} {
 proc make_machine_ctr { gdb name states param_names messages } {
     set lines {}
     
-    foreach state $states {
-        foreach message $messages {
-            set fun [ get_function $gdb $name $state $message ]
-            lappend lines \
-             "${name}_state_${state}.$message = $fun;"            
-        }
-        lappend lines "${name}_state_${state}.state_name = \"$state\";"
-    }
+    if {0} {
+		foreach state $states {
+			foreach message $messages {
+				set fun [ get_function $gdb $name $state $message ]
+				lappend lines \
+				 "${name}_state_${state}.$message = $fun;"            
+			}
+			lappend lines "${name}_state_${state}.state_name = \"$state\";"
+		}
+	}
     
     
     set params [ lrange $param_names 1 end ]
@@ -295,18 +341,54 @@ proc make_machine_ctr { gdb name states param_names messages } {
     lappend lines "function ${name}\(\) \{"
 
     lappend lines \
-     "  this.type_name = \"$name\";"
+     "  var _self = this;"
+    lappend lines \
+     "  _self.type_name = \"$name\";"
 
     set first [ lindex $states 0 ]
-    lappend lines "  this.state = ${name}_state_${first};"
+    lappend lines "  _self.state = \"${first}\";"
     
     foreach message $messages {
         lappend lines \
-         "  this.$message = function\($params_str\) \{"
+         "  _self.$message = function\($params_str\) \{"
+        
         lappend lines \
-         "    this.state.$message\(this, $params_str\);"
+         "    var _state_ = _self.state;"
+        set first 1
+        foreach state $states {
+
+			set call ""
+			set method [gen::make_normal_state_method $name $state $message ]
+			if {[gen::diagram_exists $gdb $method ]} {
+				set call "      return ${method}(_self, $params_str\);"
+			} else {
+				set method [gen::make_default_state_method $name $state]
+				if {[gen::diagram_exists $gdb $method ]} {
+					set call "      return ${method}(_self, $params_str\);"
+				}				
+			}
+
+			if { $call != "" } {
+				if {$first} {
+					lappend lines \
+					 "    if \(_state_ == \"$state\"\) \{"
+				} else {
+					lappend lines \
+					 "    else if \(_state_ == \"$state\"\) \{"				
+				}
+				
+				lappend lines $call				
+				
+				lappend lines \
+				 "    \}"
+				 
+				 set first 0
+			}
+		}
         lappend lines \
-         "  \}"
+         "    return null;"
+        lappend lines \
+         "  \};"
     }
     
     lappend lines \
@@ -369,10 +451,7 @@ proc build_declaration { name signature } {
         set result "function $name\("
     }
     
-	set params {}
-	foreach parameter $parameters {
-		lappend params [ lindex $parameter 0 ]
-	}
+	set params [ gen::get_param_names $parameters ]
 	set params_list [ join $params ", " ]
 	append result $params_list
 	append result "\) \{"
@@ -380,6 +459,7 @@ proc build_declaration { name signature } {
 }
 
 proc p.print_to_file { fhandle functions header footer machine_decl machine_ctrs } {
+	variable variables
 	if { $header != "" } {
 		puts $fhandle $header
 	}
@@ -390,11 +470,16 @@ proc p.print_to_file { fhandle functions header footer machine_decl machine_ctrs
     puts $fhandle $machine_decl
 	foreach function $functions {
 		lassign $function diagram_id name signature body
+		set name [ normalize_name $name ]
 		set type [ lindex $signature 0 ]
 		if { $type != "comment" } {
 			puts $fhandle ""
 			set declaration [ build_declaration $name $signature ]
 			puts $fhandle $declaration
+			set vars [gen::print_variables $variables $diagram_id $signature "var"]
+			if {$vars != "" } {
+				puts $fhandle $vars
+			}
 			set lines [ gen::indent $body 1 ]
 			puts $fhandle $lines
 			puts $fhandle "\}"

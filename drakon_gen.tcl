@@ -17,6 +17,13 @@ require msgcat {
 	"This script requires MsgCat package."
 	"Consider installing tk8.6 or later."
 }
+
+require json::write {
+	"This script requires json::write package."
+}
+
+
+
 namespace import ::msgcat::mc
 
 set script_path [ file dirname [ file normalize [ info script ] ] ]
@@ -35,6 +42,7 @@ source [ file join $script_path scripts/colors.tcl ]
 source [ file join $script_path scripts/graph2.tcl ]
 source [ file join $script_path scripts/icon.links.tcl ]
 source [ file join $script_path scripts/newfor.tcl ]
+source [ file join $script_path scripts/highlight.tcl ]
 
 source [ file join $script_path generators/c.tcl ]
 source [ file join $script_path generators/cpp.tcl ]
@@ -60,6 +68,8 @@ proc print_usage { } {
 	puts "-out <dir>              The output directory. Optional."
 	puts "or:"
 	puts "tclsh8.6 drakon_gen.tcl -folder some_folder -ext js"
+	puts "or (to convert to Drakon.Tech format):"
+	puts "tclsh8.6 drakon_gen.tcl -in hello.drn -dt 1"
 }
 
 namespace eval mw {
@@ -86,7 +96,7 @@ proc get_argument { name optional } {
 	return $arguments($name)
 }
 
-proc run { src_filename dst_filename } {
+proc run { src_filename dst_filename dt } {
 
 	mod::close db
 
@@ -100,7 +110,11 @@ proc run { src_filename dst_filename } {
 	
 	mwc::init db
 	
-	set success [ gen::generate_no_gui $dst_filename]
+	if { $dt == "" } {
+		set success [ gen::generate_no_gui $dst_filename]
+	} else {
+		set success [ gen_drakon_tech::generate_drakon_tech db $dst_filename]
+	}
 	if { !$success } {
 		exit 1
 	}
@@ -120,6 +134,7 @@ proc get_files { dir pattern } {
 	return $files
 }
 
+set dt [ get_argument -dt 1]
 set folder [ get_argument -folder 1 ]
 set folder [ file normalize $folder ]
 if { $folder != "" } {
@@ -139,7 +154,7 @@ if { $folder != "" } {
 
 		if { $dst_time < $drn_time } {
 			puts $file
-			run $file $dst
+			run $file $dst $dt
 		}
 	}	
 	
@@ -158,5 +173,5 @@ if { $folder != "" } {
 	set name [ file tail $src_filename ]
 	set dst_filename [ file join $out_dir $name ]
 
-	run $src_filename $dst_filename
+	run $src_filename $dst_filename $dt
 }

@@ -75,7 +75,8 @@ proc generate { } {
 	set db [ mwc::get_db ]
 
 	mw::show_errors
-	
+
+	newfor::clear	
 	graph::verify_all $db
 
 	if { ![ graph::errors_occured ] } {
@@ -120,7 +121,7 @@ proc generate_no_gui { dst_filename } {
 	set current_file_generation_info::language $language
 	set current_file_generation_info::generator $generator
 	
-	
+	newfor::clear
 	graph::verify_all $db
 
 	if { ![ graph::errors_occured ] } {
@@ -196,6 +197,187 @@ proc fix_graph_stage_1 { gdb callbacks append_semicolon diagram_id } {
 	fix_graph_stage_1_core $gdb $callbacks $append_semicolon $diagram_id 1
 }
 
+
+proc extract_rules { gdb } {
+	variable paths
+	variable paths2
+	set paths {}	
+	set paths2 {}
+	
+	set diagrams [ $gdb eval {
+		select diagram_id from diagrams } ]
+	
+	set rules {}
+	
+	foreach diagram_id $diagrams {
+		fix_diagram_for_rules $gdb $diagram_id
+	}
+
+	split_interleaving_paths
+	
+	return [lsort -unique $paths2]
+}
+
+proc split_interleaving_paths {} {
+	variable paths
+	
+	foreach path $paths {
+		lassign $path signature steps
+		split_interleaving $signature $steps 0 "if" {} {}
+	}	
+}
+
+
+proc finish_split_path { signature conditions actions } {
+	variable paths2
+	
+	set diagram_id [ lindex $signature 2 ]
+	if { [llength $actions] == 0 } {
+		return
+	}
+
+	if { [llength $conditions] == 0 } {
+		report_error $diagram_id {} "There must be a condition before an action"
+		return
+	}		
+	
+	set path [ list signature $signature conditions $conditions actions $actions ]
+	lappend paths2 $path
+}
+
+proc split_interleaving { signature steps i state conditions actions } {
+	if { $i >= [llength $steps] } {
+		finish_split_path $signature $conditions $actions
+	} else {
+		set item [ lindex $steps $i ]
+		set type [ lindex $item 0 ]
+		incr i
+		if {$state == "if"} {
+			if {$type == "if"} {
+				lappend conditions $item
+				split_interleaving $signature $steps $i "if" $conditions $actions
+			} else {
+				lappend actions $item
+				split_interleaving $signature $steps $i "action" $conditions $actions				
+			}
+		} else {
+			if {$type == "if"} {
+				finish_split_path $signature $conditions $actions
+				lappend conditions $item
+				split_interleaving $signature $steps $i "if" $conditions {}
+			} else {
+				lappend actions $item
+				split_interleaving $signature $steps $i "action" $conditions $actions				
+			}			
+		}	
+	}
+}
+
+
+proc get_start_info { gdb diagram_id } {
+	lassign [ $gdb eval {
+		select start_icon, params_icon
+		from branches 
+		where diagram_id = :diagram_id
+			and ordinal = 1
+	} ] start_icon params_icon
+
+	set name [ $gdb onecolumn { select name from diagrams where diagram_id = :diagram_id } ]
+
+
+	if { $params_icon == "" } {
+		set params_text ""
+	} else {
+		set params_text [ $gdb onecolumn {
+			select text from vertices where vertex_id = :params_icon } ]
+	}
+	
+	set start_item [ find_start_item $gdb $diagram_id ]	
+
+	return [list $start_icon $params_icon $name $params_text $start_item ]
+}
+
+variable paths {}
+variable paths2 {}
+
+
+proc extract_paths { gdb diagram_id } {
+	set start_info [ get_start_info $gdb $diagram_id ]
+	lassign $start_info start_icon params_icon name params_text start_item
+	
+	set signature [ list $name $params_text $diagram_id ]
+	
+	set next [ p.link_dst $gdb $start_icon 1 ]
+	extract_paths_from_icon $gdb $diagram_id $signature $next {}
+}
+
+proc extract_paths_from_icon { gdb diagram_id signature vertex_id path } {
+	variable paths
+	lassign [ $gdb eval {
+		select text, type, item_id, b
+		from vertices
+		where vertex_id = :vertex_id } ] text type item_id swapped
+	if {$type == "beginend"} {
+		lappend paths [ list $signature $path ]
+	} elseif { $type == "action" } {
+		set item [ list "action" $text ]
+		set one [ p.link_dst $gdb $vertex_id 1 ]
+		lappend path $item
+		extract_paths_from_icon $gdb $diagram_id $signature $one $path
+	} elseif { $type == "if"} {
+		set one [ p.link_dst $gdb $vertex_id 1 ]
+		set two [ p.link_dst $gdb $vertex_id 2 ]
+		if { $swapped } {
+			set neg1 0
+			set neg2 1
+		} else {
+			set neg1 1
+			set neg2 0
+		}
+		set item1 [ list "if" $text $neg1 ]
+		set item2 [ list "if" $text $neg2 ]
+		set path1 $path
+		set path2 $path
+		lappend path1 $item1 
+		lappend path2 $item2
+		extract_paths_from_icon $gdb $diagram_id $signature $one $path1
+		extract_paths_from_icon $gdb $diagram_id $signature $two $path2
+	} else {
+		report_error $diagram_id $item_id "Unsupported item type"
+		return
+	}
+
+}
+
+proc fix_diagram_for_rules { gdb diagram_id } {
+	
+	
+	set loops [ $gdb eval {
+		select vertex_id
+		from vertices
+		where type = 'loopstart' 
+			and diagram_id = :diagram_id } ]	
+			
+	if { $loops != {} } {
+		report_error $diagram_id "" "Rules cannot have loops"
+		return
+	}
+	
+	set selects [ $gdb eval {
+		select vertex_id
+		from vertices
+		where type = 'select' 
+			and diagram_id = :diagram_id } ]
+
+	foreach select $selects {
+		p.rewire_select $gdb $select $callbacks
+	}	
+	
+	p.clean_tech_vertices $gdb $diagram_id
+	
+	extract_paths $gdb $diagram_id
+}
+
 proc fix_graph_stage_1_core { gdb callbacks append_semicolon diagram_id do_selects } {
 
 	set shelf_proc [ get_callback $callbacks shelf ]
@@ -245,6 +427,353 @@ proc fix_graph_stage_1_core { gdb callbacks append_semicolon diagram_id do_selec
 	}
 
 	p.clean_tech_vertices $gdb $diagram_id
+}
+
+
+proc get_trimmed_lines { text } {
+	set raw_lines [ split $text "\n" ]
+	set lines {}
+	foreach raw_line $raw_lines {
+		set line [string trim $raw_line]
+		if { $line != "" } {
+			lappend lines $line
+		}
+	}
+	return $lines	
+}
+
+proc get_raw_lines { text } {
+	set raw_lines [ split $text "\n" ]
+	set lines {}
+	foreach raw_line $raw_lines {
+		set line [string trim $raw_line]
+		if { $line != "" } {
+			lappend lines $raw_line
+		}
+	}
+	return $lines	
+}
+
+proc ends_with_operator { text } {
+	set trimmed [ string trim $text ]
+	set last [ string range $trimmed end end ]
+	set map {, . \{ . \( . - . + . / . * . : . % . ^ .}
+	set mapped [ string map $map $last ]
+	if {$mapped == "."} {
+		return 1
+	}
+	return 0
+}
+
+proc is_lambda { line } {
+	set parts [ split $line "=" ]
+	if {[llength $parts] != 2} {
+		return 0
+	}
+	set second [string trim [ lindex $parts 1 ]]
+	set second_parts [ split $second " " ]
+
+	set part0 [ lindex $second_parts 0]
+	if {$part0 == "function"} {
+		return 1
+	}
+	
+	return 0
+}
+
+proc get_clean_type { text } {
+	set raw_lines [ get_raw_lines $text ]
+	if { [llength $raw_lines] < 2 } {
+		return {}
+	}
+	set first_whitespace "\[ \t\]*"	
+	set lines {}
+	set first 1
+
+	foreach raw $raw_lines {
+		if {!$first && ![string match $first_whitespace $raw]} {
+			return {}
+		}
+		set first 0
+		
+		set line [string trim $raw]
+		
+		if {[ends_with_operator $line]} {
+			return {}
+		}
+		
+		lappend lines $line
+	}
+	
+	set first [ lindex $lines 0 ]
+	
+	if { $first == "return" } {
+		set type "struct"
+	} elseif { [string match "*=" $first ] } {
+		set type "struct"
+	} elseif { [is_lambda $first ] } {
+		set type "lambda"
+	} else {
+		set type "proc"
+	}	
+	
+	return [list $type $lines]
+}
+
+proc has_operator_chars { text } {
+	set map {\[ . \] . \( . \) . \" . \' . \{ . \} .}
+	set mapped [ string map $map $text ]
+	set pattern "*\\.*"
+	return [string match $pattern $mapped ]
+}
+
+proc get_variables_from_line { line var_keyword } {
+
+	set parts [ split $line "=" ]
+
+	if { [ llength $parts ] == 1 } {
+		return [ extract_declarations_only $line $var_keyword ]
+	} else {
+		set first [ lindex $parts 0 ]
+		set first [ string trim $first ]		
+		if { ![has_operator_chars $first ] } {
+			return [ extract_declarations_or_use $first $var_keyword ]
+		}		
+	}
+	
+	return { {} {} }
+}
+
+proc extract_declarations_only { first var_keyword } {
+	set result [ extract_declarations_or_use $first $var_keyword ]
+	lassign $result dec used
+	if { $dec == "" } {
+		return { {} {} }
+	}
+	
+	return $result
+}
+		
+	
+proc extract_declarations_or_use { first var_keyword } {
+	set names {}
+	set has_declaration 0
+	
+	set parts [ split $first "," ]
+	foreach part $parts {
+		set subs [ split_by_whitespace $part ]
+		if { [ llength $subs ] == 1} {
+			lappend names [ lindex $subs 0 ]
+		} else {
+			lassign $subs left right
+			if {$left == $var_keyword } {
+				lappend names $right
+				set has_declaration 1
+			}
+		}
+	}
+	
+	if { $has_declaration } {
+		return [ list $names {} ]
+	} else {
+		return [ list {} $names ]
+	}
+}
+
+proc strip_declaration { text var_keyword } {
+	set parts [ split $text ]
+	set result ""
+	foreach part $parts {
+		if { $part == $var_keyword } {
+			return ""
+		}
+		if { $part != "" } {
+			set result $part
+		}
+	}
+	return $result
+}
+
+proc get_item_text { gdb diagram_id item_id } {
+	lassign [ $gdb eval {
+		select text
+		from items
+		where diagram_id = :diagram_id
+		and item_id = :item_id
+	} ] text
+	return $text
+}
+
+proc set_item_text { gdb diagram_id item_id text} {
+	$gdb eval {
+		update items
+		set text = :text
+		where diagram_id = :diagram_id
+		and item_id = :item_id
+	}
+}
+
+proc clean_proc { lines indent} {
+	set first [lindex $lines 0]
+	set rest [lrange $lines 1 end]
+	set result "$indent${first}\(\n$indent    "
+	set rest_text [ join $rest ",\n$indent    "]
+	return $result${rest_text}\n$indent\)
+}
+
+
+
+proc clean_lambda { lines keys } {
+	lassign $keys field_ass lambda_start lambda_end
+	set first [lindex $lines 0]
+	set second [lindex $lines 1]
+	set body_lines [lrange $lines 1 end]
+	
+	set parts [ split $first "=" ]
+	set left [ string trim [ lindex $parts 0 ]]
+	set right [ lindex $parts 1 ]
+	set vars [ lrange $right 1 end]
+	set vars_str [ join $vars ", " ]
+	set body "    ${second}\(\n        "
+	if { [llength $body_lines] == 1} {
+		set rest_text "    $second"
+	} elseif { $second == "return" } {
+		set rest_text [ clean_struct $body_lines $keys "    "]
+	} else {
+		set rest_text [ clean_proc $body_lines "    "]
+	}
+	return "$left = function\($vars_str\) $lambda_start\n$rest_text\n$lambda_end"
+}
+
+proc clean_struct_field { line field_ass } {
+	set first [ string first ":" $line ]
+	if {$first == -1} {
+		error "Field name is missing in line: $line"
+	}
+	incr first
+	set value [ string range $line $first end]
+	set value [ string trim $value]
+	incr first -2
+	set name [ string range $line 0 $first ]
+	set name [ string trim $name]
+	return "$name $field_ass $value"
+}
+
+proc clean_struct { lines keys indent} {
+	set field_ass [ lindex $keys 0 ]
+	set first [lindex $lines 0]
+	set rest [lrange $lines 1 end]
+	set rest_lines {}
+	foreach line $rest {
+		set formatted [ clean_struct_field $line $field_ass]
+		lappend rest_lines $formatted
+	}
+	set rest_text [ join $rest_lines ",\n$indent    "]
+	return "$indent${first} \{\n$indent    $rest_text\n$indent\}"
+}
+
+proc rewrite_clean_text { text keys} {
+	set clean_type [ get_clean_type $text]
+	if { $clean_type == "" } {
+		return $text
+	}
+	lassign $clean_type type lines
+	if { $type == "proc" } {
+		return [ clean_proc $lines ""]		
+	} elseif {$type == "lambda"} {
+		return [ clean_lambda $lines $keys ]
+	} else {
+		return [ clean_struct $lines $keys ""]
+	}
+}
+
+proc rewrite_clean_for_item { gdb vertex_id field_ass } {
+	set text [ p.vertex_text $gdb $vertex_id ]	
+	set text2 [ rewrite_clean_text $text $field_ass ]
+	
+	$gdb eval {
+		update vertices
+		set text = :text2
+		where vertex_id = :vertex_id
+	}
+}
+
+proc rewrite_clean { gdb diagram_id field_ass } {
+	set actions [ $gdb eval {
+		select vertex_id
+		from vertices
+		where type = 'action' 
+			and diagram_id = :diagram_id } ]
+	
+	foreach vertex_id $actions {
+		rewrite_clean_for_item $gdb $vertex_id $field_ass
+	}
+}
+
+proc extract_variables { gdb diagram_id var_keyword } {	
+	set res [get_variables_from_diagram $gdb $diagram_id $var_keyword]
+	return $res
+}
+
+proc get_original { gdb diagram_id } {
+	set original_id [ $gdb onecolumn { select original_id from diagrams where diagram_id = :diagram_id } ]
+
+	return $original_id
+}
+
+proc get_actions { gdb diagram_id } {
+	set original_id [ get_original $gdb $diagram_id ]
+	if { $original_id == "" } {
+		set did $diagram_id
+		set actions [ $gdb eval {
+			select item_id
+			from items
+			where diagram_id = :did
+			and (type = 'action' or type = 'loopstart')
+		} ]		
+	} else {
+		set did $original_id
+		set actions [ $gdb eval {
+			select vertices.item_id
+			from vertices
+			inner join items on vertices.item_id = items.item_id
+			where vertices.diagram_id = :diagram_id
+			and (items.type = 'action' or items.type = 'loopstart')
+		} ]
+	}
+	return [list $actions $did]
+}
+	
+proc get_action_lines { gdb diagram_id } {
+	lassign [ get_actions $gdb $diagram_id ] actions did
+
+	set result {}
+	foreach item_id $actions {
+		set text [get_item_text $gdb $did $item_id]
+		set lines [ split $text "\n" ]
+		foreach line $lines {
+			set line [ string trim $line ]
+			if { $line != "" } {
+				lappend result $line
+			}
+		}
+	}
+	
+	return $result
+}	
+
+proc get_variables_from_diagram { gdb diagram_id var_keyword } {
+	set declared {}
+	set used {}
+	set lines [ get_action_lines $gdb $diagram_id ]
+	foreach line $lines {
+		lassign [ get_variables_from_line $line $var_keyword ] dec use
+		set declared [ concat $declared $dec ]
+		set used [ concat $used $use ]
+	}
+	set used [ lsort -unique $used ]
+	set used2 [ subtract $used $declared ]
+	return $used2
 }
 
 proc fix_graph_for_diagram { gdb callbacks append_semicolon diagram_id } {
@@ -503,17 +1032,19 @@ proc p.merge_vertices { gdb vertex_id next commentator line_end } {
 	set this_text [ p.vertex_text $gdb $vertex_id ]
 	set that_text [ p.vertex_text $gdb $next ]
 	set that_item [ p.vertex_item $gdb $next ]
-	set marker [ $commentator "item $that_item" ]
+	set marker [ $commentator "item $that_item" ]	
 	set this [ string trim $this_text ]
 	set that [ string trim $that_text ]
 	if { $this == "" && $that == "" } {
 		set new_text ""
 	} elseif { $this == "" && $that != "" } {
-		set new_text "$marker\n$that_text"
+		#set new_text "$marker\n$that_text"
+		set new_text "$that_text"
 	} elseif { $this != "" && $that == "" } {
 		set new_text $this_text
 	} else {
-		set new_text "$this_text$line_end\n$marker\n$that_text"
+		#set new_text "$this_text$line_end\n$marker\n$that_text"
+		set new_text "$this_text$line_end\n$that_text"
 	}
 	$gdb eval {
 		update vertices
@@ -1249,7 +1780,8 @@ proc p.scan_vertices { result_list gdb vertices commentor } {
 			} elseif { [ one_entry_exit $gdb $dst ] &&
 						[ many_exists $gdb $vertex_id ]} {
 				set merged_item [ p.vertex_item $gdb $dst ]
-				set code [ list [ $commentor "item $merged_item" ] ]
+				#set code [ list [ $commentor "item $merged_item" ] ]
+				set code {}
 				set next_text [ p.vertex_text $gdb $dst ]
 				foreach line [ split $next_text "\n" ] {
 					lappend code $line
@@ -1407,31 +1939,15 @@ proc generate_function { gdb diagram_id callbacks nogoto to } {
 	set commentator [ get_callback $callbacks comment ]
 	set enforce_nogoto [ get_optional_callback $callbacks enforce_nogoto ]
 
-	lassign [ $gdb eval {
-		select start_icon, params_icon
-		from branches 
-		where diagram_id = :diagram_id
-			and ordinal = 1
-	} ] start_icon params_icon
+	set start_info [ get_start_info $gdb $diagram_id ]
+	lassign $start_info start_icon params_icon name params_text start_item
 
-	set name [ $gdb onecolumn { select name from diagrams where diagram_id = :diagram_id } ]
-
-
-	if { $params_icon == "" } {
-		set params_text ""
-	} else {
-		set params_text [ $gdb onecolumn {
-			select text from vertices where vertex_id = :params_icon } ]
-	}
 
 	set signature [ $extract_signature $params_text $name ]
 	lassign $signature errorMessage real_sign
 	if { $errorMessage != "" } {
 		report_error $diagram_id {} $errorMessage
 	}
-	
-	set start_item [ find_start_item $gdb $diagram_id ]
-
 
 	set tree ""
 	
@@ -1809,6 +2325,15 @@ proc print_node { texts node callback depth } {
 	return [ print_node_core $texts $node $callback $depth "" ]
 }
 
+proc get_if_close { callback } {
+	set if_block_end [ get_optional_callback $callback if_block_end ]
+	if {$if_block_end != ""} {
+		return $if_block_end
+	}
+
+	return [ get_callback $callback block_close ]
+}
+
 proc print_node_core { texts node callback depth break_var } {
 	set line_end [ get_optional_callback $callback line_end ]
 	set commentator [ get_callback $callback comment ]
@@ -1818,6 +2343,7 @@ proc print_node_core { texts node callback depth break_var } {
 	#set continue_str [ $continue_cb ]
 	
 	set block_close [ get_callback $callback block_close ]
+	set if_close [get_if_close $callback ]
 	set while_start [ get_callback $callback while_start ]
 	set else_start [ get_callback $callback else_start ]
 	set pass [ get_callback $callback pass ]
@@ -1845,7 +2371,7 @@ proc print_node_core { texts node callback depth break_var } {
 				if { [ llength $parts ] != 0 } {
 					append_line_end result $i $line_end			
 					set comment [ $commentator "item $current" ]
-					lappend result $indent$comment
+					#lappend result $indent$comment
 				}
 
 				foreach part $parts {
@@ -1876,7 +2402,7 @@ proc print_node_core { texts node callback depth break_var } {
 			if { $start_item_info == "" } {
 				set cond_text [ get_text_lines $texts $cond_item ]
 				set comment [ $commentator "item $cond_item" ]
-				lappend result $indent$comment
+				#lappend result $indent$comment
 
 				set cond [ condition_line $callback $cond_text ]
 				lappend result $indent$cond
@@ -1885,11 +2411,14 @@ proc print_node_core { texts node callback depth break_var } {
 				set else_node [ lindex $current 2 ]
 				set then [ print_node_core $texts $then_node $callback $next_depth $break_var ]
 				set result [ concat $result $then ]
-			
-				lappend result "$indent[ $else_start ]"
-				set else [ print_node_core $texts $else_node $callback $next_depth $break_var ]
-				set result [ concat $result $else ]
-				$block_close result $depth
+				
+				if {$else_node != "seq" } {
+					lappend result "$indent[ $else_start ]"
+					set else [ print_node_core $texts $else_node $callback $next_depth $break_var ]
+					set result [ concat $result $else ]
+				}
+				
+				$if_close result $depth
 			}
 			set was_return 0
 		} elseif { [ lindex $current 0 ] == "loop" } {
@@ -2124,6 +2653,7 @@ proc p.keywords { } {
 		shelf
 		if_cond
 		change_state
+		shutdown
 		fsm_merge
 		select
 		case_value
@@ -2135,6 +2665,7 @@ proc p.keywords { } {
 		native_foreach
 		can_glue
 		exit_door
+		if_block_end
 	}
 }
 
@@ -2166,6 +2697,54 @@ proc get_optional_callback { map action } {
 	return [ get_value $map $action ]
 }
 
-
+proc get_param_names { parameters } {
+	set params {}
+	foreach parameter $parameters {
+		lappend params [ lindex $parameter 0 ]
+	}
+	return $params	
 }
 
+proc print_variables { variables diagram_id signature var_keyword } {	
+	lassign $signature type access parameters returns
+	set params [ get_param_names $parameters ]
+	if {[dict exists $variables $diagram_id ]} {
+		set vars_all [ dict get $variables $diagram_id ]
+		set vars {}
+		foreach var $vars_all {
+			if { ![contains $params $var] } {
+				lappend vars $var
+			}
+		}
+		
+		if { $vars != {} } {
+			set vars_str [join $vars ", " ]
+			set line "    $var_keyword $vars_str"
+			return $line
+		}
+	}
+	return ""
+}
+
+proc diagram_exists { gdb name } {
+	set id [ $gdb onecolumn {
+		select diagram_id
+		from diagrams
+		where name = :name }]
+	
+	if {$id == ""} {
+		return 0
+	} else {
+		return 1
+	}
+}
+
+proc make_normal_state_method { name state message } {
+	return "${name}_${state}_${message}"
+}
+
+proc make_default_state_method { name state } {
+	return "${name}_${state}_default"
+}
+
+}

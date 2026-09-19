@@ -802,6 +802,7 @@ proc open_files { filenames mode } {
 	foreach filename $filenames {
 		if { [ catch {
 			set handle [ open $filename $mode ]
+			fconfigure $handle -encoding "utf-8"
 			lappend handles $handle
 		} message ] } {
 			close_files $handles
@@ -999,6 +1000,9 @@ proc append_not_empty { list_name item } {
 }
 
 proc mc2 { text } {
+	if { [texts::get "language"] == "English" } {
+		return [ uplevel 1 "set mc2_tmp_var \"$text\"" ]
+	}
 	set translated [ mc $text ]
 	return [ uplevel 1 "set mc2_tmp_var \"$translated\"" ]
 }
@@ -1012,6 +1016,17 @@ proc subtract { from what } {
 	}
 	return $output
 }
+
+proc split_by_whitespace { text } {
+	set result {}
+	set parts [ split $text ]
+	foreach part $parts {
+		if { $part != "" } {
+			lappend result $part
+		}
+	}
+	return $result
+}	
 
 proc clear_tree { tree parent } {
 	set children [ $tree children $parent ]
@@ -1060,4 +1075,10 @@ proc get_optional { dictionary key } {
         #item 390
         return ""
     }
+}
+
+proc open_output_file { filename } {	
+	set handle [ open $filename w ]
+	fconfigure $handle -encoding "utf-8"
+	return $handle
 }
